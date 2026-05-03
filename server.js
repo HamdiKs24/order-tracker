@@ -1,5 +1,4 @@
 import express from 'express';
-import Database from 'better-sqlite3';
 import cors from 'cors';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -17,34 +16,51 @@ function logMessage(message) {
     const timestamp = new Date().toISOString();
     const logLine = `[${timestamp}] ${message}\n`;
     console.log(logLine);
-    fs.appendFileSync('webhook-logs.txt', logLine);
+    try {
+        fs.appendFileSync('webhook-logs.txt', logLine);
+    } catch(e) { /* ignore if can't write */ }
 }
 
 logMessage('🚀 Server starting up...');
 
-// Create database
-const db = new Database('orders.db');
+// Dynamic import for better-sqlite3 (handles compatibility better)
+let db;
+async function initDatabase() {
+    try {
+        const Database = (await import('better-sqlite3')).default;
+        db = new Database('orders.db');
+        
+        // Create table
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_code TEXT UNIQUE,
+                customer_name TEXT,
+                phone TEXT,
+                amount REAL,
+                status TEXT,
+                order_date TEXT,
+                delivery_date TEXT,
+                raw_data TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        
+        logMessage('✅ Database ready');
+        return true;
+    } catch (error) {
+        logMessage('❌ Database error: ' + error.message);
+        return false;
+    }
+}
 
-// Create table
-db.exec(`
-    CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_code TEXT UNIQUE,
-        customer_name TEXT,
-        phone TEXT,
-        amount REAL,
-        status TEXT,
-        order_date TEXT,
-        delivery_date TEXT,
-        raw_data TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-`);
-
-logMessage('✅ Database ready');
-
-// WEBHOOK ENDPOINT - Your store will send data here
+// WEBHOOK ENDPOINT - Your store sends data here
 app.post('/webhook/order-update', (req, res) => {
+    if (!db) {
+        logMessage('⚠️ Database not ready, order not saved');
+        return res.status(500).json({ error: 'Database not ready' });
+    }
+    
     const order = req.body;
     logMessage('📦 Webhook received! Data: ' + JSON.stringify(order));
     
@@ -80,25 +96,30 @@ app.post('/webhook/order-update', (req, res) => {
     logMessage(`📊 Order: ${orderCode}, Amount: ${amount}, Status: ${status}, Delivered: ${isDelivered}`);
     
     if (isDelivered && amount > 0) {
-        const stmt = db.prepare(`
-            INSERT OR REPLACE INTO orders 
-            (order_code, customer_name, phone, amount, status, order_date, delivery_date, raw_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-        
-        stmt.run(
-            orderCode, 
-            customerName, 
-            phone, 
-            amount, 
-            status, 
-            new Date().toISOString(),
-            new Date().toISOString(),
-            JSON.stringify(order)
-        );
-        
-        logMessage(`✅ RECORDED: ${orderCode} - ${amount} TND`);
-        res.status(200).json({ success: true, message: 'Order recorded' });
+        try {
+            const stmt = db.prepare(`
+                INSERT OR REPLACE INTO orders 
+                (order_code, customer_name, phone, amount, status, order_date, delivery_date, raw_data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `);
+            
+            stmt.run(
+                orderCode, 
+                customerName, 
+                phone, 
+                amount, 
+                status, 
+                new Date().toISOString(),
+                new Date().toISOString(),
+                JSON.stringify(order)
+            );
+            
+            logMessage(`✅ RECORDED: ${orderCode} - ${amount} TND`);
+            res.status(200).json({ success: true, message: 'Order recorded' });
+        } catch (err) {
+            logMessage(`❌ Database error: ${err.message}`);
+            res.status(500).json({ error: 'Database error' });
+        }
     } else {
         logMessage(`⏭️ Skipped (not delivered): ${orderCode}`);
         res.status(200).json({ success: true, message: 'Received but not delivered' });
@@ -107,50 +128,68 @@ app.post('/webhook/order-update', (req, res) => {
 
 // API - Get daily breakdown
 app.get('/api/daily-breakdown', (req, res) => {
-    const rows = db.prepare(`
-        SELECT 
-            DATE(delivery_date) as date,
-            COUNT(*) as order_count,
-            SUM(amount) as total,
-            GROUP_CONCAT(amount) as amounts
-        FROM orders 
-        WHERE status LIKE '%delivered%' OR status LIKE '%paid%' OR status = 'completed'
-        GROUP BY DATE(delivery_date)
-        ORDER BY date DESC
-    `).all();
+    if (!db) {
+        return res.json([]);
+    }
     
-    const result = rows.map(row => {
-        const amountList = row.amounts.split(',').map(Number);
-        const breakdown = {};
-        amountList.forEach(amt => {
-            breakdown[amt] = (breakdown[amt] || 0) + 1;
+    try {
+        const rows = db.prepare(`
+            SELECT 
+                DATE(delivery_date) as date,
+                COUNT(*) as order_count,
+                SUM(amount) as total,
+                GROUP_CONCAT(amount) as amounts
+            FROM orders 
+            WHERE status LIKE '%delivered%' OR status LIKE '%paid%' OR status = 'completed'
+            GROUP BY DATE(delivery_date)
+            ORDER BY date DESC
+        `).all();
+        
+        const result = rows.map(row => {
+            const amountList = row.amounts.split(',').map(Number);
+            const breakdown = {};
+            amountList.forEach(amt => {
+                breakdown[amt] = (breakdown[amt] || 0) + 1;
+            });
+            
+            return {
+                date: row.date,
+                total: row.total,
+                count: row.order_count,
+                breakdown: breakdown,
+                formula: Object.entries(breakdown)
+                    .map(([amt, qty]) => `${qty}x${amt}TND`)
+                    .join(' + ')
+            };
         });
         
-        return {
-            date: row.date,
-            total: row.total,
-            count: row.order_count,
-            breakdown: breakdown,
-            formula: Object.entries(breakdown)
-                .map(([amt, qty]) => `${qty}x${amt}TND`)
-                .join(' + ')
-        };
-    });
-    
-    res.json(result);
+        res.json(result);
+    } catch (err) {
+        logMessage(`❌ Daily breakdown error: ${err.message}`);
+        res.json([]);
+    }
 });
 
 // API - Get all orders
 app.get('/api/orders', (req, res) => {
-    const orders = db.prepare(`
-        SELECT order_code, customer_name, phone, amount, delivery_date
-        FROM orders 
-        WHERE status LIKE '%delivered%' OR status LIKE '%paid%' OR status = 'completed'
-        ORDER BY delivery_date DESC
-        LIMIT 100
-    `).all();
+    if (!db) {
+        return res.json([]);
+    }
     
-    res.json(orders);
+    try {
+        const orders = db.prepare(`
+            SELECT order_code, customer_name, phone, amount, delivery_date
+            FROM orders 
+            WHERE status LIKE '%delivered%' OR status LIKE '%paid%' OR status = 'completed'
+            ORDER BY delivery_date DESC
+            LIMIT 100
+        `).all();
+        
+        res.json(orders);
+    } catch (err) {
+        logMessage(`❌ Orders fetch error: ${err.message}`);
+        res.json([]);
+    }
 });
 
 // Serve the dashboard
@@ -158,11 +197,17 @@ app.get('/', (req, res) => {
     res.sendFile(join(__dirname, 'dashboard.html'));
 });
 
-// Start server
+// Start server after database is ready
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    logMessage(`🚀 Server running on port ${PORT}`);
-    console.log(`\n✅ Your tracker is LIVE!`);
-    console.log(`📊 Dashboard: https://your-app.onrender.com`);
-    console.log(`🔗 Webhook URL: https://your-app.onrender.com/webhook/order-update\n`);
+
+initDatabase().then(() => {
+    app.listen(PORT, '0.0.0.0', () => {
+        logMessage(`🚀 Server running on port ${PORT}`);
+        console.log(`\n✅ Your tracker is LIVE!`);
+        console.log(`📊 Dashboard: https://your-app.onrender.com`);
+        console.log(`🔗 Webhook URL: https://your-app.onrender.com/webhook/order-update\n`);
+    });
+}).catch(err => {
+    logMessage(`❌ Failed to start: ${err.message}`);
+    process.exit(1);
 });
